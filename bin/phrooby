@@ -1,0 +1,135 @@
+#!/usr/bin/env ruby
+require 'sinatra'
+require 'json'
+
+$directory = File.expand_path(ARGV[0] || Dir.getwd)
+
+unless Dir.exists? $directory
+  $stderr.puts "That folder doesn't exist!"
+  Process.exit
+end
+
+set :public, $directory
+
+state = {
+  :rewrite => false,
+  :rewrite_rules => {},
+  :rewrite_condition =>nil
+}
+
+if File.exists?(File.join($directory,'.htaccess'))
+  begin
+    f = open(File.join($directory,'.htaccess'))
+    
+    while !f.eof?
+      case line = f.gets
+      when /^RewriteEngine\ (on|off)$/
+        state[:rewrite] = $1.downcase == 'on'
+      when /^RewriteRule (.+) (.+)(?:\ \[(.+)\])/
+        flags = ($3 || '').split(',')
+        state[:rewrite_rules][Regexp.new($1)] = [$2,state[:rewrite_condition],flags] if state[:rewrite]
+        
+        if flags.include? 'L'
+          state[:rewrite_condition] = nil
+        end
+      when /^RewriteCond (.+) -f$/
+        test = $1
+        state[:rewrite_condition] = lambda do |backreferences|
+          filename = test.gsub('%{DOCUMENT_ROOT}',$directory).gsub(/\$(\d+)/,backreferences[$1.to_i])
+          File.exists?(filename)
+        end
+      when /^#/,/^$/
+      else
+        puts line
+      end
+    end
+  ensure
+    f.close
+  end
+  
+  require 'pp'
+  pp state
+end
+
+before do
+  state[:rewrite_rules].each_pair do |rule,details|
+    uri = URI.parse(request.env['REQUEST_URI'])
+    
+    if rule.match(uri.path[1..-1]) # htaccess doesn't assume leading slash
+      request.env['REQUEST_URI'] = '/'+uri.path[1..-1].gsub(rule,details[0].gsub(/\$(\d+)/,'\\\\\\1'))
+      if (details[1].call([uri.path[1..-1],$1,$2,$3,$4,$5,$6,$7,$8,$9]) rescue true) # Only if Conditions have been met
+        new_uri = URI.parse(request.env['REQUEST_URI'])
+        request.env['PATH_INFO'] = new_uri.path
+        request.env['REQUEST_PATH'] = new_uri.path
+        request.env['QUERY_STRING'] = [new_uri.query,(details[2].include? 'QSA') ? uri.query : nil].compact.join('&')
+        request.path_info = new_uri.path
+        break if details[2].include? 'L'
+      end
+    end
+  end
+end
+
+helpers do
+  def send_to_php(phpfile,method,params)
+    p phpfile
+    halt(404) if !File.exists?(phpfile)
+
+    puts php = "php \"#{File.expand_path(File.join(__FILE__,'..','..','lib','prepare.php'))}\""
+
+    IO.popen(php, "r+") {|io|
+      io.puts [phpfile,env,method,params].to_json
+      io.close_write
+      
+      #while !io.eof?
+        response.write io.read
+      #end
+    }
+  end
+end
+
+error 404 do
+  "404!"
+end
+
+get '/' do
+  if File.exists?(File.join($directory,'index.php'))
+    send_to_php(File.join($directory,'index.php'),'GET',params)
+  elsif File.exists?(File.join($directory,'index.html'))
+    redirect '/index.html'
+  elsif File.exists?(File.join($directory,'index.htm'))
+    redirect '/index.htm'
+  else
+    halt(404)
+  end
+end
+
+post '/' do
+  if File.exists?(File.join($directory,'index.php'))
+    send_to_php(File.join($directory,'index.php'),'POST',params)
+  elsif File.exists?(File.join($directory,'index.html'))
+    redirect '/index.html'
+  elsif File.exists?(File.join($directory,'index.htm'))
+    redirect '/index.htm'
+  else
+    halt(404)
+  end
+end
+
+get '/*.php' do
+  p params
+  phpfile = File.join($directory,params['splat'][0]+'.php')
+  send_to_php(phpfile,'GET',params)
+end
+
+post '/*.php' do
+  phpfile = File.join($directory,params['splat'][0]+'.php')
+  send_to_php(phpfile,'POST',params)
+end
+
+get '/.htaccess' do
+  halt(404)
+end
+
+#get '*' do
+#  ":( #{params[:splat][0]}"
+#end
